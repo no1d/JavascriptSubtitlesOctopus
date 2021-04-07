@@ -15,6 +15,10 @@ self.height = 0;
 self.fontMap_ = {};
 self.fontId = 0;
 
+self.preciseLastFrame = -1;
+self.preciseCount = 0;
+
+
 /**
  * Make the font accessible by libass by writing it to the virtual FS.
  * @param {!string} font the font name.
@@ -63,7 +67,9 @@ self.writeAvailableFontsToFS = function(content) {
 };
 
 self.getRenderMethod = function () {
-    if (self.renderMode == 'fast') {
+    if (self.renderMode === 'precise') {
+        return self.preciseRender;
+    } else if (self.renderMode == 'fast') {
         return self.fastRender;
     } else if (self.renderMode == 'blend') {
         return self.blendRender;
@@ -117,6 +123,19 @@ self.resize = function (width, height) {
     self.octObj.resizeCanvas(width, height);
 };
 
+self.parseTimestamps = function (content) {
+    self.timestamps = [];
+    let lines = content.split('\n');
+    let n = 0;
+    for (const line of lines) {
+        if (!line || line.charAt(0) === '#')
+            continue;
+
+        self.timestamps[n] = +line;
+        n++;
+    }
+}
+
 self.getCurrentTime = function () {
     var diff = (Date.now() - self.lastCurrentTimeReceivedAt) / 1000;
     if (self._isPaused) {
@@ -133,6 +152,13 @@ self.getCurrentTime = function () {
 self.setCurrentTime = function (currentTime) {
     self.lastCurrentTime = currentTime;
     self.lastCurrentTimeReceivedAt = Date.now();
+
+    // get frame at current time
+    if (self.timestamps) {
+        self.preciseLastFrame = self.timestamps.findIndex(f => f > currentTime * 1000) - 1;
+        self.preciseCount = 0;
+    }
+
     if (!self.rafId) {
         if (self.nextIsRaf) {
             self.rafId = self.requestAnimationFrame(self.getRenderMethod());
@@ -256,6 +282,73 @@ self.fastRender = function (force) {
     }
     if (!self._isPaused) {
         self.rafId = self.requestAnimationFrame(self.fastRender);
+    }
+};
+
+self.preciseRender = function (force) {
+    const frameBufSize = 30;
+
+    if (self.debug) {
+        console.log('[Worker] preciseRender: self.preciseLastFrame=' + self.preciseLastFrame + ' preciseCount=' + self.preciseCount);
+    }
+
+    if (self.preciseLastFrame >= 0 && self.preciseLastFrame < self.timestamps.length - 1 && self.preciseCount < frameBufSize) {
+        const startTime = performance.now();
+        const time = self.timestamps[self.preciseLastFrame + 1] / 1000; // + self.delay; delay kinda doesn't make sense here, right?
+        const renderResult = self.octObj.renderImage(time, self.changed);
+        const changed = Module.getValue(self.changed, "i32");
+
+        if (self.debug) {
+            console.log('[Worker] preciseRender: time=' + time + ', result=' + renderResult + ', changed=' + changed);
+        }
+
+        if (changed !== 0 || self.preciseLastFrame <= 0 || force) {
+            const result = self.buildResult(renderResult);
+            const newTime = performance.now();
+            const libassTime = newTime - startTime;
+            const promises = [];
+            for (const image of result[0]) {
+                const imageBuffer = new Uint8ClampedArray(image.buffer);
+                const imageData = new ImageData(imageBuffer, image.w, image.h);
+                promises.push(createImageBitmap(imageData, 0, 0, image.w, image.h));
+            }
+            Promise.all(promises).then(function (imgs) {
+                const decodeTime = performance.now() - newTime;
+                const bitmaps = [];
+                for (let i = 0; i < imgs.length; i++) {
+                    const image = result[0][i];
+                    bitmaps[i] = {
+                        x: image.x,
+                        y: image.y,
+                        bitmap: imgs[i]
+                    };
+                }
+
+                postMessage({
+                    target: "canvas",
+                    op: "renderPreciseCanvas",
+                    time: self.timestamps[self.preciseLastFrame],
+                    frame: self.preciseLastFrame,
+                    libassTime: libassTime,
+                    decodeTime: decodeTime,
+                    bitmaps: bitmaps
+                }, imgs);
+            });
+        } else {
+            postMessage({
+                target: "canvas",
+                op: "renderPreciseCanvasUnchanged",
+                time: self.timestamps[self.preciseLastFrame],
+                frame: self.preciseLastFrame
+            });
+        }
+
+        self.preciseLastFrame++;
+        self.preciseCount++;
+    }
+
+    if (!self._isPaused) {
+        self.rafId = self.requestAnimationFrame(self.preciseRender);
     }
 };
 
@@ -540,6 +633,9 @@ function onMessageFromMainEmscriptenThread(message) {
             self.targetFps = message.data.targetFps || self.targetFps;
             self.libassMemoryLimit = message.data.libassMemoryLimit || self.libassMemoryLimit;
             self.libassGlyphLimit = message.data.libassGlyphLimit || 0;
+            if (message.data.timestampsUrl) {
+                self.parseTimestamps(read_(message.data.timestampsUrl));
+            }
             removeRunDependency('worker-init');
             break;
         }

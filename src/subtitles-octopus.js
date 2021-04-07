@@ -39,6 +39,9 @@ var SubtitlesOctopus = function (options) {
 
     self.hasAlphaBug = false;
 
+    self.timestampsUrl = options.timestampsUrl; // Link to timestamps v2 file (optional, enables precise render)
+
+
     (function() {
         if (typeof ImageData.prototype.constructor === 'function') {
             try {
@@ -93,6 +96,11 @@ var SubtitlesOctopus = function (options) {
         }
         self.workerActive = false;
         self.createCanvas();
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype && self.timestampsUrl) {
+            self.renderQueue = [];
+            self.renderMode = 'precise';
+            self.targetFps = 60;
+        }
         self.setVideo(options.video);
         self.setSubUrl(options.subUrl);
         self.worker.postMessage({
@@ -110,7 +118,8 @@ var SubtitlesOctopus = function (options) {
             debug: self.debug,
             targetFps: self.targetFps,
             libassMemoryLimit: self.libassMemoryLimit,
-            libassGlyphLimit: self.libassGlyphLimit
+            libassGlyphLimit: self.libassGlyphLimit,
+            timestampsUrl: self.timestampsUrl
         });
     };
 
@@ -178,6 +187,7 @@ var SubtitlesOctopus = function (options) {
                 self.video.removeEventListener("timeupdate", timeupdate);
             }, false);
             self.video.addEventListener("seeked", function () {
+                self.renderQueue = [];
                 self.video.addEventListener("timeupdate", timeupdate, false);
                 self.setCurrentTime(video.currentTime + self.timeOffset);
             }, false);
@@ -212,6 +222,9 @@ var SubtitlesOctopus = function (options) {
                     self.resize();
                 }, false);
             }
+
+            if (self.renderMode === 'precise')
+                self.video.requestVideoFrameCallback(self.preciseFrameCallback);
         }
     };
 
@@ -237,6 +250,41 @@ var SubtitlesOctopus = function (options) {
     self.setSubUrl = function (subUrl) {
         self.subUrl = subUrl;
     };
+
+    self.preciseFrameCallback = function (now, metadata) {
+        if (self.debug)
+            console.log(now, metadata);
+
+        if (self.debug) {
+            if (self.renderQueue.length > 0) {
+                console.log('Queue length: ' + self.renderQueue.length + ', first frame: num=' + self.renderQueue[0].frame + ', time=' + self.renderQueue[0].time);
+            } else {
+                console.log('Queue length: ' + self.renderQueue.length);
+            }
+        }
+
+        const frameIndex = self.renderQueue.findIndex(f => f.time >= Math.floor(metadata.mediaTime * 1000));
+        if (frameIndex >= 0) {
+            const frame = self.renderQueue[frameIndex];
+
+            if (self.debug) console.log(frame);
+
+            self.renderQueue.splice(0, frameIndex - 2);
+            const beforeDrawTime = performance.now();
+            self.ctx.clearRect(0, 0, self.canvas.width, self.canvas.height);
+            for (const image of frame.bitmaps) {
+                self.ctx.drawImage(image.bitmap, image.x, image.y);
+            }
+
+            if (self.debug) {
+                const drawTime = Math.round(performance.now() - beforeDrawTime);
+                console.log(frame.bitmaps.length + ' bitmaps, libass: ' + Math.round(frame.libassTime) + 'ms, decode: ' + Math.round(frame.decodeTime) + 'ms, draw: ' + drawTime + 'ms');
+                self.renderStart = performance.now();
+            }
+        }
+
+        self.video.requestVideoFrameCallback(self.preciseFrameCallback);
+    }
 
     self.renderFrameData = null;
     function renderFrames() {
@@ -356,6 +404,19 @@ var SubtitlesOctopus = function (options) {
                             self.renderFramesData = data;
                             window.requestAnimationFrame(renderFastFrames);
                         }
+                        break;
+                    }
+                    case 'renderPreciseCanvas': {
+                        self.lastFrameData = data;
+                        self.renderQueue.push(data);
+                        break;
+                    }
+                    case 'renderPreciseCanvasUnchanged': {
+                        if (self.lastFrameData !== undefined) {
+                            data.bitmaps = self.lastFrameData.bitmaps;
+                            self.lastFrameData = data;
+                        }
+                        self.renderQueue.push(data);
                         break;
                     }
                     case 'setObjectProperty': {
